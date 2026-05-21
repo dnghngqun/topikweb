@@ -1,0 +1,68 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: topik
+      POSTGRES_USER: topik
+      POSTGRES_PASSWORD: topik
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/001-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U topik -d topik"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  backend:
+    build:
+      context: ./backend
+    env_file:
+      - ./.env
+    environment:
+      NODE_ENV: production
+      PORT: 4000
+      DATABASE_URL: postgres://topik:topik@db:5432/topik
+      CORS_ORIGIN: http://localhost:5173,http://127.0.0.1:5173
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-openrouter/free}
+      CRAWLER_ENABLED: ${CRAWLER_ENABLED:-true}
+      CRAWL_INTERVAL_HOURS: ${CRAWL_INTERVAL_HOURS:-24}
+      CRAWLER_TICK_MINUTES: ${CRAWLER_TICK_MINUTES:-60}
+      CRAWL_ON_START_FORCE: ${CRAWL_ON_START_FORCE:-true}
+      CRAWL_IMPORT_DISCOVERED: ${CRAWL_IMPORT_DISCOVERED:-true}
+      CRAWL_IMPORT_DISCOVERED_LIMIT: ${CRAWL_IMPORT_DISCOVERED_LIMIT:-30}
+      PUBLIC_BACKEND_URL: ${PUBLIC_BACKEND_URL:-http://localhost:4000}
+      TOPIK_DISCOVERY_MAX_DE: ${TOPIK_DISCOVERY_MAX_DE:-3}
+      CRAWL_SOURCES: ${CRAWL_SOURCES:-https://dethitracnghiem.vn/bai-thi/de-thi-topik-1-de-1/,https://dethitracnghiem.vn/de-thi-topik/,https://dethitracnghiem.vn/de-thi-topik-1/,https://dethitracnghiem.vn/de-thi-topik-2/,https://prepedu.com/vi/blog/de-thi-topik-1,https://prepedu.com/vi/blog/de-thi-topik-2,https://onthitopik.com/tai-tron-bo-de-thi-topik-va-dap-an/,https://study4.com/tests/?term=topik&page=1,https://study4.com/tests/topik-i/,https://study4.com/tests/topik-ii/,https://www.thongtinduhochanquoc.com/tron-bo-de-thi-topik-i-topik-ii-tieng-han-ki-52-co-dap-an/}
+      FIREBASE_PROJECT_ID: ${FIREBASE_PROJECT_ID:-}
+      FIREBASE_CLIENT_EMAIL: ${FIREBASE_CLIENT_EMAIL:-}
+      FIREBASE_PRIVATE_KEY: ${FIREBASE_PRIVATE_KEY:-}
+      DEV_AUTH_ENABLED: ${DEV_AUTH_ENABLED:-true}
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - crawler_storage:/app/storage
+    ports:
+      - "4000:4000"
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_URL: ${VITE_API_URL:-http://localhost:4000/api}
+        VITE_FIREBASE_API_KEY: ${VITE_FIREBASE_API_KEY:-}
+        VITE_FIREBASE_AUTH_DOMAIN: ${VITE_FIREBASE_AUTH_DOMAIN:-}
+        VITE_FIREBASE_PROJECT_ID: ${VITE_FIREBASE_PROJECT_ID:-}
+        VITE_FIREBASE_APP_ID: ${VITE_FIREBASE_APP_ID:-}
+        VITE_DEV_AUTH_ENABLED: ${VITE_DEV_AUTH_ENABLED:-true}
+    depends_on:
+      - backend
+    ports:
+      - "5173:80"
+
+volumes:
+  pgdata:
+  crawler_storage:
