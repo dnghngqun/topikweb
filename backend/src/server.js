@@ -230,42 +230,37 @@ app.post('/api/exams/:slug/attempts', requireAuth, async (req, res) => {
   res.status(201).json({ attempt: result.rows[0] });
 });
 
-app.patch('/api/attempts/:id', requireAuth, async (req, res) => {
-  const result = await query(
-    `UPDATE attempts
-     SET answers = $1, status = COALESCE($2, status), submitted_at = CASE WHEN $2 = 'submitted' THEN now() ELSE submitted_at END
-     WHERE id = $3 AND user_id = $4
-     RETURNING *`,
-    [JSON.stringify(req.body.answers || {}), req.body.status || null, req.params.id, req.user.id],
-  );
-  if (!result.rows[0]) return res.status(404).json({ error: 'Attempt not found' });
-  res.json({ attempt: result.rows[0] });
-});
+function stripHtml(value) {
+  return String(value || '')
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
 
-app.get('/api/attempts/:id/result', requireAuth, async (req, res) => {
-  const attemptResult = await query(
-    `SELECT a.*, e.slug, e.topik_level, e.round_no, e.title_ko, e.title_en, e.question_count, e.total_score
-     FROM attempts a
-     JOIN exams e ON e.id = a.exam_id
-     WHERE a.id = $1 AND a.user_id = $2`,
-    [req.params.id, req.user.id],
-  );
-  const attempt = attemptResult.rows[0];
-  if (!attempt) return res.status(404).json({ error: 'Attempt not found' });
-
+async function gradeAttempt(examId, answers) {
   const questionResult = await query(
-    `SELECT number, points, answer, type
+    `SELECT id, number, points, prompt, passage, content_html, answer, type, choices, explanation
      FROM questions
      WHERE exam_id = $1
      ORDER BY number`,
-    [attempt.exam_id],
+    [examId],
   );
 
-  const answers = attempt.answers || {};
   let autoScore = 0;
   let autoGradable = 0;
+  let autoGradableScore = 0;
   let correctCount = 0;
   let answeredCount = 0;
+  let manualCount = 0;
+  const choiceText = (question, value) => {
+    if (!value) return null;
+    const choices = Array.isArray(question.choices) ? question.choices : [];
+    const found = choices.find((choice) => String(choice.id) === String(value) || String(choice.label) === String(value));
+    const raw = found?.text || found?.html || String(value);
+    return String(raw).replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
+  };
   const items = questionResult.rows.map((question) => {
     const userAnswer = answers[String(question.number)] ?? answers[question.number];
     const answered =
@@ -279,22 +274,175 @@ app.get('/api/attempts/:id/result', requireAuth, async (req, res) => {
     const key = question.answer || {};
     const correctChoice = key.choice || key.id || key.correct;
     const gradable = question.type === 'multiple_choice' && correctChoice && key.status !== 'unknown';
+    if (!gradable && question.type !== 'multiple_choice') manualCount += 1;
     const correct = gradable && String(userAnswer) === String(correctChoice);
-    if (gradable) autoGradable += 1;
+    if (gradable) {
+      autoGradable += 1;
+      autoGradableScore += Number(question.points || 0);
+    }
     if (correct) {
       correctCount += 1;
       autoScore += Number(question.points || 0);
     }
+    const scoreAwarded = correct ? Number(question.points || 0) : 0;
     return {
+      question_id: question.id,
       number: question.number,
       points: question.points,
       type: question.type,
       user_answer: userAnswer || null,
+      user_answer_text: choiceText(question, userAnswer),
       correct_answer: gradable ? correctChoice : null,
+      correct_answer_text: gradable ? choiceText(question, correctChoice) : null,
+      score_awarded: scoreAwarded,
+      explanation: question.explanation || '',
       gradable,
       correct,
     };
   });
+
+  return {
+    summary: {
+      answered_count: answeredCount,
+      question_count: questionResult.rows.length,
+      auto_gradable_count: autoGradable,
+      auto_gradable_score: autoGradableScore,
+      manual_count: manualCount,
+      correct_count: correctCount,
+      auto_score: autoScore,
+      has_answer_key: autoGradable > 0,
+    },
+    items,
+  };
+}
+
+function parseJsonArray(content) {
+  const text = String(content || '').trim();
+  try {
+    const parsed = JSON.parse(text);
+    return Array.isArray(parsed) ? parsed : parsed.items || parsed.explanations || [];
+  } catch (_error) {
+    const match = text.match(/\[[\s\S]*\]/);
+    if (!match) return [];
+    try {
+      const parsed = JSON.parse(match[0]);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (__error) {
+      return [];
+    }
+  }
+}
+
+async function ensureAiExplanations(examId, gradedItems) {
+  if (!process.env.OPENROUTER_API_KEY) return;
+
+  const targetItems = gradedItems
+    .filter((item) => item.gradable && item.user_answer && !String(item.explanation || '').trim())
+    .slice(0, Number(process.env.AI_EXPLANATION_LIMIT || 80));
+  if (!targetItems.length) return;
+
+  const questionResult = await query(
+    `SELECT id, number, prompt, passage, content_html, choices, answer, explanation
+     FROM questions
+     WHERE exam_id = $1 AND number = ANY($2::int[])
+     ORDER BY number`,
+    [examId, targetItems.map((item) => item.number)],
+  );
+  const itemByNumber = new Map(targetItems.map((item) => [item.number, item]));
+  const missing = questionResult.rows.filter((question) => !String(question.explanation || '').trim());
+  const chunks = [];
+  for (let index = 0; index < missing.length; index += 12) chunks.push(missing.slice(index, index + 12));
+
+  for (const chunk of chunks) {
+    const payload = chunk.map((question) => {
+      const item = itemByNumber.get(question.number);
+      const choices = Array.isArray(question.choices) ? question.choices : [];
+      return {
+        number: question.number,
+        prompt: stripHtml(question.prompt),
+        passage: stripHtml(question.passage || question.content_html).slice(0, 900),
+        choices: choices.map((choice) => ({
+          id: choice.id,
+          text: stripHtml(choice.text || choice.html),
+        })),
+        correct_answer: item?.correct_answer_text || item?.correct_answer,
+      };
+    });
+
+    try {
+      const response = await askOpenRouter([
+        {
+          role: 'system',
+          content:
+            'Bạn là giáo viên luyện thi TOPIK cho người Việt. Tạo lời giải ngắn, đúng trọng tâm, giải thích tại sao đáp án đúng. Không nhắc tới lựa chọn của học viên. Không bịa transcript/audio hoặc nội dung không có trong dữ liệu. Nếu thiếu passage/transcript, nói rõ "Theo đáp án chính thức" rồi giải thích ý của đáp án đúng dựa trên choices. Trả về JSON array, mỗi phần tử có number và explanation.',
+        },
+        {
+          role: 'user',
+          content: `Tạo lời giải tiếng Việt cho các câu sau. Mỗi explanation tối đa 2 câu.\n${JSON.stringify(payload)}`,
+        },
+      ], { temperature: 0.15, max_tokens: 2200 });
+      const explanations = parseJsonArray(response.content);
+      for (const entry of explanations) {
+        const number = Number(entry.number);
+        const explanation = String(entry.explanation || '').replace(/\s+/g, ' ').trim();
+        const question = chunk.find((row) => row.number === number);
+        if (!question || explanation.length < 8) continue;
+        await query(
+          `UPDATE questions
+           SET explanation = $1
+           WHERE id = $2 AND COALESCE(NULLIF(explanation, ''), '') = ''`,
+          [explanation.slice(0, 1200), question.id],
+        );
+      }
+    } catch (error) {
+      console.warn(`[ai-explanation] failed: ${error.message}`);
+      return;
+    }
+  }
+}
+
+app.patch('/api/attempts/:id', requireAuth, async (req, res) => {
+  const answers = req.body.answers || {};
+  const status = req.body.status || null;
+  const existingResult = await query(
+    `SELECT a.*, e.total_score
+     FROM attempts a
+     JOIN exams e ON e.id = a.exam_id
+     WHERE a.id = $1 AND a.user_id = $2`,
+    [req.params.id, req.user.id],
+  );
+  const existingAttempt = existingResult.rows[0];
+  if (!existingAttempt) return res.status(404).json({ error: 'Attempt not found' });
+
+  const graded = status === 'submitted' ? await gradeAttempt(existingAttempt.exam_id, answers) : null;
+  const result = await query(
+    `UPDATE attempts
+     SET answers = $1,
+         status = COALESCE($2, status),
+         score = CASE WHEN $2 = 'submitted' THEN $3 ELSE score END,
+         submitted_at = CASE WHEN $2 = 'submitted' THEN now() ELSE submitted_at END
+     WHERE id = $4 AND user_id = $5
+     RETURNING *`,
+    [JSON.stringify(answers), status, graded?.summary.auto_score ?? null, req.params.id, req.user.id],
+  );
+  res.json({ attempt: result.rows[0], summary: graded?.summary || null });
+});
+
+app.get('/api/attempts/:id/result', requireAuth, async (req, res) => {
+  const attemptResult = await query(
+    `SELECT a.*, e.slug, e.topik_level, e.round_no, e.title_ko, e.title_en, e.question_count, e.total_score
+     FROM attempts a
+     JOIN exams e ON e.id = a.exam_id
+     WHERE a.id = $1 AND a.user_id = $2`,
+    [req.params.id, req.user.id],
+  );
+  const attempt = attemptResult.rows[0];
+  if (!attempt) return res.status(404).json({ error: 'Attempt not found' });
+
+  const answers = attempt.answers || {};
+  const graded = await gradeAttempt(attempt.exam_id, answers);
+  await ensureAiExplanations(attempt.exam_id, graded.items);
+  const enriched = await gradeAttempt(attempt.exam_id, answers);
 
   res.json({
     attempt,
@@ -308,15 +456,10 @@ app.get('/api/attempts/:id/result', requireAuth, async (req, res) => {
       total_score: attempt.total_score,
     },
     summary: {
-      answered_count: answeredCount,
-      question_count: questionResult.rows.length,
-      auto_gradable_count: autoGradable,
-      correct_count: correctCount,
-      auto_score: autoScore,
+      ...enriched.summary,
       total_score: attempt.total_score,
-      has_answer_key: autoGradable > 0,
     },
-    items,
+    items: enriched.items,
   });
 });
 

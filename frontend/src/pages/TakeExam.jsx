@@ -57,6 +57,7 @@ export function TakeExam() {
   const [showSubmitConfirm, setShowSubmitConfirm] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const audioRef = useRef(null);
+  const previousAudioSrcRef = useRef('');
 
   useEffect(() => {
     api(`/exams/${slug}/questions`).then(async (payload) => {
@@ -83,6 +84,18 @@ export function TakeExam() {
     data?.sections?.find((sectionItem) => current >= sectionItem.question_start && current <= sectionItem.question_end) || null;
   const section = currentSection?.section_key || questionType(current);
   const activeAudioSrc = section === 'listening' ? (question?.audio_url || exam?.audio_url || '') : '';
+  const hasOnlyChoiceLabels = (question.choices || []).length > 0 && (question.choices || []).every((choice) => {
+    const text = String(choice.text || choice.html || '').replace(/<[^>]+>/g, '').replace(/\s+/g, '');
+    return /^[①②③④1-4.()]+$/.test(text);
+  });
+  const listeningAudioSources = useMemo(() => {
+    const sources = (data?.questions || [])
+      .filter((item) => item.section_key === 'listening' && (item.audio_url || exam?.audio_url))
+      .map((item) => item.audio_url || exam?.audio_url)
+      .filter(Boolean);
+    return [...new Set(sources)];
+  }, [data, exam?.audio_url]);
+  const usesSharedListeningAudio = Boolean(activeAudioSrc && listeningAudioSources.length === 1);
   const answeredCount = Object.values(answers).filter((value) => {
     if (typeof value === 'string') return value.trim();
     return Boolean(value);
@@ -136,14 +149,26 @@ export function TakeExam() {
   }
 
   useEffect(() => {
+    if (!activeAudioSrc) {
+      previousAudioSrcRef.current = '';
+      setPlaying(false);
+      setCurrentTime(0);
+      setDuration(0);
+      return;
+    }
+
+    if (previousAudioSrcRef.current === activeAudioSrc) return;
+
+    previousAudioSrcRef.current = activeAudioSrc;
     setPlaying(false);
     setCurrentTime(0);
     setDuration(0);
     if (audioRef.current) {
       audioRef.current.pause();
       audioRef.current.currentTime = 0;
+      audioRef.current.load();
     }
-  }, [current]);
+  }, [activeAudioSrc]);
 
   if (!data?.exam) return <div className="take-loading">Đang tải bài thi...</div>;
 
@@ -195,7 +220,13 @@ export function TakeExam() {
               <button type="button" className="blue-mini"><LayoutList size={18} /></button>
               <button type="button" className="speed" onClick={cycleSpeed}>{playbackRate}x</button>
             </div>
-            <div className="transcript">{activeAudioSrc ? `Audio câu ${question.number}` : 'Đề nghe này chưa có audio, crawler sẽ không đưa lên danh sách chính.'}</div>
+            <div className="transcript">
+              {activeAudioSrc
+                ? usesSharedListeningAudio
+                  ? 'Audio toàn bài nghe'
+                  : `Audio câu ${question.number}`
+                : 'Đề nghe này chưa có audio, crawler sẽ không đưa lên danh sách chính.'}
+            </div>
             <audio
               ref={audioRef}
               src={activeAudioSrc}
@@ -219,7 +250,7 @@ export function TakeExam() {
               {!question.content_html && question.image_url ? (
                 <img className="question-image" src={question.image_url} alt={`Question ${question.number}`} />
               ) : null}
-              {question.content_html && /<img/i.test(question.content_html) ? (
+              {question.content_html && /<img/i.test(question.content_html) && hasOnlyChoiceLabels ? (
                 <div className="image-choice-note">Chọn đáp án tương ứng với ảnh/biểu đồ phía trên.</div>
               ) : null}
               {question.type === 'essay' ? (

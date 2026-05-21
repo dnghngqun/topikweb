@@ -12,6 +12,9 @@ const execFileAsync = promisify(execFile);
 const STORAGE_ROOT = process.env.CRAWLER_STORAGE_DIR || path.resolve(process.cwd(), 'storage');
 const MEDIA_BASE_URL = (process.env.PUBLIC_BACKEND_URL || 'http://localhost:4000').replace(/\/+$/, '');
 const CIRCLED_TO_CHOICE = { '①': '1', '②': '2', '③': '3', '④': '4' };
+const CHOICE_LABELS = ['①', '②', '③', '④'];
+const PDF_RENDER_DPI = 120;
+const PDF_POINT_SCALE = PDF_RENDER_DPI / 72;
 
 function absoluteUrl(base, href) {
   try {
@@ -64,7 +67,11 @@ function inferSlug(sourceUrl, level, roundNo) {
 
 function inferMetaFromName(sourceUrl, name, importedFrom = null) {
   const text = `${sourceUrl} ${name || ''}`;
-  const roundMatch = text.match(/(?:제\s*)?(\d{2,3})\s*(?:회|th|st|nd|rd)?/i);
+  const roundMatch =
+    text.match(/(?:제\s*)?(\d{2,3})\s*회/i) ||
+    text.match(/(?:Ky|Kỳ|Ki|Kì|회|TOPIK\s*[ⅠI12]*\s*Ky)\s*[-_ ]*(\d{2,3})/i) ||
+    text.match(/(\d{2,3})(?:th|st|nd|rd)\s+TOPIK/i) ||
+    text.match(/TOPIK\s*[ⅠI12]*\s*(\d{2,3})/i);
   const roundNo = roundMatch ? Number(roundMatch[1]) : Math.floor(Date.now() / 100000000);
   const level = /TOPIK\s*(?:1|I(?!I))|TOPIK1|토픽\s*(?:1|I(?!I))/i.test(text) && !/TOPIK\s*(?:2|II)|TOPIK2|토픽\s*(?:2|II)/i.test(text) ? 'I' : 'II';
   return {
@@ -143,8 +150,24 @@ function classifyAssetFiles(files) {
   const audio = files.filter((file) => /^audio\//i.test(file.mime) || /\.(mp3|wav|m4a|ogg)$/i.test(file.name));
   const answers = pdfs.filter((file) => isAnswerKeyName(file.name));
   const exams = pdfs.filter((file) => isExamPdfName(file.name));
-  const primaryExam = exams.find((file) => /듣기.*읽기|기출|TOPIK\s*1|TOPIK1|TOPIK\s*2|TOPIK2/i.test(file.name)) || exams[0];
-  return { pdfs, audio, answers, exams, primaryExam };
+  const combinedExam = exams.find((file) => /(?:듣기|nghe|listening).*(?:읽기|đọc|doc|reading)|(?:읽기|đọc|doc|reading).*(?:듣기|nghe|listening)|기출/i.test(file.name));
+  const usableExamPdfs = combinedExam
+    ? [combinedExam]
+    : exams
+        .filter((file) => !/통합|transcript|script|file\s*nghe|mp3|audio/i.test(file.name))
+        .sort((a, b) => {
+          const rank = (file) => {
+            if (/듣기|nghe|listening/i.test(file.name)) return 1;
+            if (/쓰기|viet|viết|writing/i.test(file.name)) return 2;
+            if (/읽기|doc|đọc|reading/i.test(file.name)) return 3;
+            if (/_1(?:\D*)\.pdf$/i.test(file.name)) return 1;
+            if (/_2(?:\D*)\.pdf$/i.test(file.name)) return 3;
+            return 9;
+          };
+          return rank(a) - rank(b) || a.name.localeCompare(b.name);
+        });
+  const primaryExam = usableExamPdfs[0] || exams[0];
+  return { pdfs, audio, answers, exams, primaryExam, usableExamPdfs };
 }
 
 async function ensureDir(dir) {
@@ -196,6 +219,41 @@ async function pdfText(pdfPath) {
   return commandText('pdftotext', [pdfPath, '-']);
 }
 
+function decodeHtmlText(text) {
+  return String(text || '')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'");
+}
+
+async function pdfBboxPages(pdfPath) {
+  const html = await commandText('pdftotext', ['-bbox', pdfPath, '-']);
+  const $ = cheerio.load(html, { xmlMode: true });
+  const pages = [];
+  $('page').each((_, page) => {
+    const pageNode = $(page);
+    const words = [];
+    pageNode.find('word').each((__, word) => {
+      const wordNode = $(word);
+      words.push({
+        text: decodeHtmlText(wordNode.text()),
+        xMin: Number(wordNode.attr('xMin')),
+        yMin: Number(wordNode.attr('yMin')),
+        xMax: Number(wordNode.attr('xMax')),
+        yMax: Number(wordNode.attr('yMax')),
+      });
+    });
+    pages.push({
+      width: Number(pageNode.attr('width')) || 595,
+      height: Number(pageNode.attr('height')) || 842,
+      words,
+    });
+  });
+  return pages;
+}
+
 function parseAnswerKeysFromText(text, { level, sectionHint }) {
   const sourceText = String(text || '');
   const firstScoreLabel = sourceText.indexOf('배점');
@@ -213,25 +271,26 @@ function parseAnswerKeysFromText(text, { level, sectionHint }) {
   const firstRow = tokens.findIndex((token, index) => Number(token) > 0 && isChoice(tokens[index + 1]) && isScore(tokens[index + 2]));
   if (firstRow < 0) return answers;
 
-  const addAnswer = (numberToken, answerToken) => {
+  const addAnswer = (numberToken, answerToken, scoreToken) => {
     const number = Number(numberToken);
     if (!number || number > 120) return;
     const choice = CIRCLED_TO_CHOICE[answerToken] || (/^[1-4]$/.test(answerToken) ? answerToken : '');
     if (!choice) return;
+    const points = Number(scoreToken) || 0;
     let questionNumber = number;
     if (/reading/i.test(sectionHint || '') || /읽기/.test(text)) {
       if (level === 'I' && number <= 40) questionNumber = number + 30;
       if (level === 'II' && number <= 50) questionNumber = number + 54;
     }
-    answers.set(questionNumber, choice);
+    answers.set(questionNumber, { choice, points });
   };
 
   for (let index = firstRow; index < tokens.length - 2; index += 6) {
     if (Number(tokens[index]) && isChoice(tokens[index + 1]) && isScore(tokens[index + 2])) {
-      addAnswer(tokens[index], tokens[index + 1]);
+      addAnswer(tokens[index], tokens[index + 1], tokens[index + 2]);
     }
     if (Number(tokens[index + 3]) && isChoice(tokens[index + 4]) && isScore(tokens[index + 5])) {
-      addAnswer(tokens[index + 3], tokens[index + 4]);
+      addAnswer(tokens[index + 3], tokens[index + 4], tokens[index + 5]);
     }
   }
   return answers;
@@ -244,45 +303,73 @@ async function parseAnswerKeyFiles(answerFiles, workDir, meta) {
     const text = await pdfText(local);
     const sectionHint = /읽기|reading/i.test(file.name) ? 'reading' : /듣기|listening/i.test(file.name) ? 'listening' : '';
     const parsed = parseAnswerKeysFromText(text, { level: meta.topik_level, sectionHint });
-    parsed.forEach((choice, number) => answers.set(number, choice));
+    parsed.forEach((answer, number) => answers.set(number, answer));
   }
   return answers;
 }
 
-async function renderPdfPages(pdfPath, imageDir, slug) {
+async function renderPdfPages(pdfPath, imageDir, slug, prefix = 'page') {
   await ensureDir(imageDir);
-  const marker = path.join(imageDir, '.rendered');
+  const marker = path.join(imageDir, `.rendered-${prefix}`);
+  const markerValue = `${pdfPath}\n`;
+  const pattern = new RegExp(`^${prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}-\\d+\\.png$`);
+  let shouldRender = false;
   try {
-    await fs.access(marker);
+    const existingMarker = await fs.readFile(marker, 'utf8');
+    shouldRender = existingMarker !== markerValue;
   } catch (_error) {
-    await execFileAsync('pdftoppm', ['-png', '-r', '120', pdfPath, path.join(imageDir, 'page')], {
+    shouldRender = true;
+  }
+  if (shouldRender) {
+    const existingFiles = await fs.readdir(imageDir).catch(() => []);
+    await Promise.all(existingFiles.filter((file) => pattern.test(file)).map((file) => fs.unlink(path.join(imageDir, file))));
+    await execFileAsync('pdftoppm', ['-png', '-r', '120', pdfPath, path.join(imageDir, prefix)], {
       maxBuffer: 20 * 1024 * 1024,
     });
-    await fs.writeFile(marker, new Date().toISOString());
+    await fs.writeFile(marker, markerValue);
   }
   const files = (await fs.readdir(imageDir))
-    .filter((file) => /^page-\d+\.png$/.test(file))
+    .filter((file) => pattern.test(file))
     .sort((a, b) => Number(a.match(/\d+/)[0]) - Number(b.match(/\d+/)[0]));
   return files.map((file, index) => ({
     page: index + 1,
     url: storageUrl(path.join(imageDir, file)),
+    path: path.join(imageDir, file),
     slug,
   }));
 }
 
-function mapQuestionPages(pdfPagesText, pageImages, meta) {
-  const pageByQuestion = new Map();
-  const readingStartIndex = pdfPagesText.findIndex((pageText) => /TOPIK\s*(?:Ⅰ|I|Ⅱ|II)?\s*읽기|읽기\s*\(/i.test(pageText));
-  const sections = meta.topik_level === 'I'
+function sectionBounds(pdfPagesText, meta) {
+  const findSectionStart = (sectionKey) => {
+    const sectionKorean = sectionKey === 'listening' ? '듣기' : sectionKey === 'reading' ? '읽기' : '쓰기';
+    return pdfPagesText.findIndex((pageText) => {
+      const compact = pageText.replace(/\s+/g, ' ');
+      const hasTopikSection = new RegExp(`TOPIK\\s*(?:Ⅰ|I|Ⅱ|II)?\\s*${sectionKorean}\\s*\\(`, 'i').test(compact);
+      const hasQuestionRange = new RegExp(`\\d+\\s*번\\s*[～~\\-]\\s*\\d+\\s*번\\)?\\s*.*${sectionKorean}`, 'i').test(compact);
+      return hasTopikSection || hasQuestionRange;
+    });
+  };
+  const listeningStartIndex = findSectionStart('listening');
+  const readingStartIndex = findSectionStart('reading');
+  const writingStartIndex = findSectionStart('writing');
+  const listeningStart = listeningStartIndex >= 0 ? listeningStartIndex : 0;
+  const readingStart = readingStartIndex >= 0 ? readingStartIndex : listeningStart;
+  const writingStart = writingStartIndex >= 0 ? writingStartIndex : listeningStart;
+  return meta.topik_level === 'I'
     ? [
-        { from: 1, to: 30, offset: 0, minPage: 0, maxPage: readingStartIndex > 0 ? readingStartIndex : Infinity },
-        { from: 31, to: 70, offset: 0, minPage: readingStartIndex > 0 ? readingStartIndex : 0, maxPage: Infinity },
+        { from: 1, to: 30, offset: 0, minPage: listeningStart, maxPage: readingStartIndex > 0 ? readingStartIndex : Infinity },
+        { from: 31, to: 70, offset: 0, minPage: readingStart, maxPage: Infinity },
       ]
     : [
-        { from: 1, to: 50, offset: 0, minPage: 0, maxPage: readingStartIndex > 0 ? readingStartIndex : Infinity },
-        { from: 51, to: 54, offset: 0, minPage: 0, maxPage: readingStartIndex > 0 ? readingStartIndex : Infinity },
-        { from: 55, to: 104, offset: -54, minPage: readingStartIndex > 0 ? readingStartIndex : 0, maxPage: Infinity },
+        { from: 1, to: 50, offset: 0, minPage: listeningStart, maxPage: writingStartIndex > 0 ? writingStartIndex : readingStartIndex > 0 ? readingStartIndex : Infinity },
+        { from: 51, to: 54, offset: 0, minPage: writingStart, maxPage: readingStartIndex > 0 ? readingStartIndex : Infinity },
+        { from: 55, to: 104, offset: -54, minPage: readingStart, maxPage: Infinity },
       ];
+}
+
+function mapQuestionPages(pdfPagesText, pageImages, meta) {
+  const pageByQuestion = new Map();
+  const sections = sectionBounds(pdfPagesText, meta);
 
   pdfPagesText.forEach((pageText, pageIndex) => {
     const compact = pageText.replace(/\s+/g, ' ');
@@ -298,12 +385,281 @@ function mapQuestionPages(pdfPagesText, pageImages, meta) {
     }
   });
 
-  let lastUrl = pageImages.find((page) => page.page > 1)?.url || pageImages[0]?.url || '';
+  const firstQuestionPage = Number.isFinite(sections[0]?.minPage) ? sections[0].minPage : 0;
+  let lastUrl = pageImages[firstQuestionPage]?.url || pageImages.find((page) => page.page > 1)?.url || pageImages[0]?.url || '';
   for (let number = 1; number <= meta.question_count; number += 1) {
     if (pageByQuestion.has(number)) lastUrl = pageByQuestion.get(number);
     else pageByQuestion.set(number, lastUrl);
   }
   return pageByQuestion;
+}
+
+function isQuestionMarker(word, printedNumber) {
+  const escaped = String(printedNumber).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`^${escaped}(?:\\s*[.)]|$)`).test(word.text);
+}
+
+function hasChoiceMarkerAfter(page, word) {
+  return page.words.some((candidate) => (
+    candidate.yMin >= word.yMin - 3 &&
+    candidate.yMin <= word.yMin + 320 &&
+    CHOICE_LABELS.some((label) => candidate.text.includes(label))
+  ));
+}
+
+function isInstructionPage(page) {
+  const text = page.words.map((word) => word.text).join(' ');
+  return /Information|Registration\s*No|Do\s+not\s+open|Write\s+your\s+name|유\s*의\s*사\s*항|수험번호/i.test(text);
+}
+
+function findQuestionMarkers(bboxPages, pdfPagesText, meta) {
+  const sections = sectionBounds(pdfPagesText, meta);
+  const markers = [];
+  for (const section of sections) {
+    for (let pageIndex = section.minPage; pageIndex < Math.min(bboxPages.length, section.maxPage + 1); pageIndex += 1) {
+      const page = bboxPages[pageIndex];
+      if (isInstructionPage(page)) continue;
+      for (let number = section.from; number <= section.to; number += 1) {
+        if (markers.some((marker) => marker.number === number)) continue;
+        const printed = number + section.offset;
+        const needsChoices = questionSection(meta, number) !== 'writing';
+        const candidates = page.words.filter((word) => (
+          isQuestionMarker(word, printed) &&
+          word.xMin >= 40 &&
+          word.xMin <= 110 &&
+          word.yMin >= 60 &&
+          word.yMin <= page.height - 35 &&
+          (!needsChoices || hasChoiceMarkerAfter(page, word))
+        ));
+        if (candidates.length) {
+          const chosen = candidates.sort((a, b) => a.yMin - b.yMin)[0];
+          markers.push({ number, printed, pageIndex, word: chosen, section });
+        }
+      }
+    }
+  }
+  return markers.sort((a, b) => a.pageIndex - b.pageIndex || a.word.yMin - b.word.yMin || a.number - b.number);
+}
+
+function wordsInBox(page, box) {
+  return page.words.filter((word) => (
+    word.xMax >= box.x &&
+    word.xMin <= box.x + box.width &&
+    word.yMax >= box.y &&
+    word.yMin <= box.y + box.height
+  ));
+}
+
+function instructionTopForQuestion(page, marker) {
+  const instruction = page.words
+    .filter((word) => word.text === '※' && word.yMin >= 90 && word.yMin < marker.word.yMin - 8)
+    .sort((a, b) => b.yMin - a.yMin)[0];
+  return instruction ? Math.max(65, instruction.yMin - 18) : Math.max(65, marker.word.yMin - 18);
+}
+
+function groupContextsForPage(page, pageMarkers) {
+  return page.words
+    .filter((word) => word.text === '※')
+    .map((word) => {
+      const lineWords = page.words
+        .filter((candidate) => Math.abs(candidate.yMin - word.yMin) <= 8 && candidate.xMin >= word.xMin)
+        .sort((a, b) => a.xMin - b.xMin);
+      const lineText = lineWords.map((candidate) => candidate.text).join('');
+      const range = lineText.match(/[［\[]\s*(\d{1,3})\s*[~～\-–]\s*(\d{1,3})\s*[］\]]/);
+      if (!range) return null;
+      const first = Number(range[1]);
+      const last = Number(range[2]);
+      if (!first || !last || first > last) return null;
+      const rangeMarkers = pageMarkers.filter((marker) => marker.printed >= first && marker.printed <= last);
+      const firstMarker = rangeMarkers[0];
+      if (!firstMarker || firstMarker.word.yMin <= word.yMin) return null;
+      const questionOffset = firstMarker.number - firstMarker.printed;
+      return {
+        first: first + questionOffset,
+        last: last + questionOffset,
+        pageIndex: firstMarker.pageIndex,
+        top: Math.max(65, word.yMin - 18),
+        bottom: Math.max(word.yMax + 6, firstMarker.word.yMin - 8),
+      };
+    })
+    .filter(Boolean);
+}
+
+function parseChoiceText(blockWords) {
+  const normalizedWords = blockWords.flatMap((word) => {
+    const embeddedLabel = CHOICE_LABELS.find((label) => word.text.includes(label));
+    if (!embeddedLabel || word.text === embeddedLabel) return [word];
+    const labelIndex = word.text.indexOf(embeddedLabel);
+    const before = word.text.slice(0, labelIndex).trim();
+    const after = word.text.slice(labelIndex + embeddedLabel.length).trim();
+    const markerWidth = Math.min(14, Math.max(10, word.xMax - word.xMin));
+    const marker = {
+      ...word,
+      text: embeddedLabel,
+      xMax: Math.min(word.xMax, word.xMin + markerWidth),
+    };
+    const parts = [marker];
+    if (before) {
+      parts.push({
+        ...word,
+        text: before,
+        xMax: word.xMin,
+      });
+    }
+    if (after) {
+      parts.push({
+        ...word,
+        text: after,
+        xMin: Math.min(word.xMax, marker.xMax + 2),
+      });
+    }
+    return parts;
+  });
+  const markers = normalizedWords
+    .flatMap((word) => {
+      const exactIndex = CHOICE_LABELS.indexOf(word.text);
+      if (exactIndex >= 0) return [{ ...word, text: CHOICE_LABELS[exactIndex] }];
+      const embeddedIndex = CHOICE_LABELS.findIndex((label) => word.text.includes(label));
+      if (embeddedIndex < 0) return [];
+      return [{
+        ...word,
+        text: CHOICE_LABELS[embeddedIndex],
+        xMin: Math.max(word.xMin, word.xMax - 14),
+      }];
+    })
+    .sort((a, b) => a.yMin - b.yMin || a.xMin - b.xMin);
+  const choices = [];
+  for (const [index, label] of CHOICE_LABELS.entries()) {
+    const marker = markers.find((item) => item.text === label);
+    if (!marker) {
+      choices.push({ id: String(index + 1), label: String(index + 1), text: label, html: label });
+      continue;
+    }
+    const nextSameRow = markers.find((item) => (
+      item.xMin > marker.xMin + 10 &&
+      Math.abs(item.yMin - marker.yMin) <= 8
+    ));
+    const nextSameColumn = markers.find((item) => (
+      item.yMin > marker.yMin + 3 &&
+      Math.abs(item.xMin - marker.xMin) <= 35
+    ));
+    const columnRight = nextSameRow
+      ? nextSameRow.xMin - 4
+      : marker.xMin < 250
+        ? 285
+        : 530;
+    const yEnd = nextSameColumn ? nextSameColumn.yMin - 2 : marker.yMin + 42;
+    const text = normalizedWords
+      .filter((word) => (
+        word !== marker &&
+        !CHOICE_LABELS.includes(word.text) &&
+        word.xMin >= marker.xMax + 2 &&
+        word.xMin <= columnRight &&
+        word.yMin >= marker.yMin - 4 &&
+        word.yMin <= yEnd
+      ))
+      .sort((a, b) => a.yMin - b.yMin || a.xMin - b.xMin)
+      .map((word) => word.text)
+      .join(' ')
+      .replace(/\s+([,.?!])/g, '$1')
+      .trim();
+    const display = text ? `${label} ${text}` : label;
+    choices.push({ id: String(index + 1), label: String(index + 1), text: display, html: display });
+  }
+  return choices;
+}
+
+async function cropQuestionImage(sourceImage, outputImage, page, box, options = {}) {
+  await ensureDir(path.dirname(outputImage));
+  const minWidth = options.minWidth ?? 80;
+  const minHeight = options.minHeight ?? 80;
+  const x = Math.max(0, Math.floor(box.x * PDF_POINT_SCALE));
+  const y = Math.max(0, Math.floor(box.y * PDF_POINT_SCALE));
+  const width = Math.max(minWidth, Math.ceil(box.width * PDF_POINT_SCALE));
+  const height = Math.max(minHeight, Math.ceil(box.height * PDF_POINT_SCALE));
+  await execFileAsync('convert', [sourceImage, '-crop', `${width}x${height}+${x}+${y}`, '+repage', outputImage], {
+    maxBuffer: 20 * 1024 * 1024,
+  });
+  return outputImage;
+}
+
+async function buildQuestionLayouts(bboxPages, pdfPagesText, pageImages, cropDir, meta) {
+  const layouts = new Map();
+  const markers = findQuestionMarkers(bboxPages, pdfPagesText, meta);
+  const markerByQuestion = new Map(markers.map((marker) => [marker.number, marker]));
+  const defaultPageByQuestion = mapQuestionPages(pdfPagesText, pageImages, meta);
+  const layoutVersion = Date.now().toString(36);
+  const groupContexts = bboxPages.flatMap((page, pageIndex) => {
+    const pageMarkers = markers
+      .filter((item) => item.pageIndex === pageIndex)
+      .sort((a, b) => a.word.yMin - b.word.yMin);
+    return groupContextsForPage(page, pageMarkers);
+  });
+  const contextUrlByRange = new Map();
+
+  for (let number = 1; number <= meta.question_count; number += 1) {
+    const marker = markerByQuestion.get(number);
+    if (!marker) {
+      const fallbackUrl = defaultPageByQuestion.get(number) || '';
+      layouts.set(number, { imageUrl: fallbackUrl, choices: null });
+      continue;
+    }
+    const page = bboxPages[marker.pageIndex];
+    const previousMarker = markers
+      .filter((item) => item.pageIndex === marker.pageIndex && item.word.yMin < marker.word.yMin - 4)
+      .sort((a, b) => b.word.yMin - a.word.yMin)[0];
+    const pageMarkers = markers
+      .filter((item) => item.pageIndex === marker.pageIndex)
+      .sort((a, b) => a.word.yMin - b.word.yMin);
+    const groupContext = groupContexts
+      .find((context) => number >= context.first && number <= context.last);
+    const nextMarker = markers
+      .filter((item) => item.pageIndex === marker.pageIndex && item.word.yMin > marker.word.yMin + 4)
+      .sort((a, b) => a.word.yMin - b.word.yMin)[0];
+    const nextInstruction = page.words
+      .filter((word) => word.text === '※' && word.yMin > marker.word.yMin + 8 && (!nextMarker || word.yMin < nextMarker.word.yMin))
+      .sort((a, b) => a.yMin - b.yMin)[0];
+    const groupedTop =
+      groupContext && number === groupContext.first && marker.pageIndex === groupContext.pageIndex
+        ? Math.max(groupContext.bottom + 3, marker.word.yMin - 8)
+        : marker.word.yMin - 18;
+    const top = groupContext ? Math.max(65, groupedTop) : previousMarker ? Math.max(65, marker.word.yMin - 18) : instructionTopForQuestion(page, marker);
+    const naturalBottom = nextMarker ? nextMarker.word.yMin - 10 : page.height - 45;
+    const bottom = nextInstruction ? Math.min(naturalBottom, nextInstruction.yMin - 10) : naturalBottom;
+    const box = {
+      x: 58,
+      y: top,
+      width: Math.min(500, page.width - 90),
+      height: Math.min(page.height - top - 35, bottom - top),
+    };
+    const blockWords = wordsInBox(page, box);
+    const answerWords = blockWords.filter((word) => word.yMin >= marker.word.yMin - 4);
+    const cropPath = path.join(cropDir, `q-${String(number).padStart(3, '0')}.png`);
+    await cropQuestionImage(pageImages[marker.pageIndex].path, cropPath, page, box);
+    let contextUrl = '';
+    if (groupContext) {
+      const contextKey = `${groupContext.first}-${groupContext.last}`;
+      contextUrl = contextUrlByRange.get(contextKey) || '';
+      if (!contextUrl) {
+        const contextPage = bboxPages[groupContext.pageIndex];
+        const contextPath = path.join(cropDir, `ctx-${String(groupContext.first).padStart(3, '0')}-${String(groupContext.last).padStart(3, '0')}.png`);
+        await cropQuestionImage(pageImages[groupContext.pageIndex].path, contextPath, contextPage, {
+          x: 58,
+          y: groupContext.top,
+          width: Math.min(500, contextPage.width - 90),
+          height: Math.min(contextPage.height - groupContext.top - 35, groupContext.bottom - groupContext.top),
+        }, { minHeight: 24 });
+        contextUrl = `${storageUrl(contextPath)}?v=${layoutVersion}`;
+        contextUrlByRange.set(contextKey, contextUrl);
+      }
+    }
+    layouts.set(number, {
+      imageUrl: `${storageUrl(cropPath)}?v=${layoutVersion}`,
+      contextUrl,
+      choices: parseChoiceText(answerWords),
+    });
+  }
+  return layouts;
 }
 
 function questionSection(meta, number) {
@@ -319,17 +675,26 @@ function defaultQuestionPoints(meta, number) {
   return 2;
 }
 
-function buildPdfBackedQuestions(meta, answerMap, pageByQuestion, audioUrl, sourceUrl) {
+function normalizedQuestionPoints(meta, number, answerPoints) {
+  if (Number(answerPoints) >= 1 && Number(answerPoints) <= 5) return Number(answerPoints);
+  return defaultQuestionPoints(meta, number);
+}
+
+function buildPdfBackedQuestions(meta, answerMap, questionLayouts, audioUrl, sourceUrl) {
   const questions = [];
   for (let number = 1; number <= meta.question_count; number += 1) {
     const sectionKey = questionSection(meta, number);
     const isWriting = sectionKey === 'writing';
-    const pageUrl = pageByQuestion.get(number) || '';
-    const answerChoice = answerMap.get(number);
+    const layout = questionLayouts.get(number) || {};
+    const pageUrl = layout.imageUrl || '';
+    const contextUrl = layout.contextUrl || '';
+    const answerEntry = answerMap.get(number);
+    const answerChoice = typeof answerEntry === 'object' ? answerEntry.choice : answerEntry;
+    const answerPoints = typeof answerEntry === 'object' ? answerEntry.points : 0;
     questions.push({
       number,
       section_key: sectionKey,
-      points: defaultQuestionPoints(meta, number),
+      points: normalizedQuestionPoints(meta, number, answerPoints),
       prompt: sectionKey === 'listening'
         ? '다음을 듣고 알맞은 답을 고르십시오.'
         : sectionKey === 'reading'
@@ -337,14 +702,14 @@ function buildPdfBackedQuestions(meta, answerMap, pageByQuestion, audioUrl, sour
           : '다음 문항에 맞게 쓰십시오.',
       passage: '',
       content_html: pageUrl
-        ? `<div class="pdf-page-question"><img src="${pageUrl}" alt="TOPIK question page ${number}" loading="lazy" /></div>`
+        ? `<div class="pdf-page-question">${contextUrl ? `<img src="${contextUrl}" alt="TOPIK shared prompt for question ${number}" loading="lazy" />` : ''}<img src="${pageUrl}" alt="TOPIK question page ${number}" loading="lazy" /></div>`
         : '',
       image_url: pageUrl,
       audio_url: sectionKey === 'listening' ? audioUrl : '',
       type: isWriting ? (number === 54 ? 'essay' : 'short_answer') : 'multiple_choice',
       choices: isWriting
         ? []
-        : [
+        : layout.choices || [
             { id: '1', label: '1', text: '①', html: '①' },
             { id: '2', label: '2', text: '②', html: '②' },
             { id: '3', label: '3', text: '③', html: '③' },
@@ -352,7 +717,7 @@ function buildPdfBackedQuestions(meta, answerMap, pageByQuestion, audioUrl, sour
           ],
       answer: answerChoice ? { choice: answerChoice, source: 'public_answer_key_pdf' } : isWriting ? { status: 'manual' } : { status: 'unknown' },
       explanation: '',
-      media: { pdf_page_image: pageUrl, audio: sectionKey === 'listening' && audioUrl ? [audioUrl] : [] },
+      media: { pdf_page_image: pageUrl, context_image: contextUrl, audio: sectionKey === 'listening' && audioUrl ? [audioUrl] : [] },
       source_url: sourceUrl,
     });
   }
@@ -365,7 +730,7 @@ async function importDriveFolderExam(sourceUrl, html) {
   const meta = inferMetaFromName(sourceUrl, files.map((file) => file.name).join(' '), 'google-drive');
   const audioFile = assets.audio[0];
   const missing = [];
-  if (!assets.primaryExam) missing.push('exam_pdf');
+  if (!assets.usableExamPdfs?.length) missing.push('exam_pdf');
   if (!assets.answers.length) missing.push('answer_key_pdf');
   if (!audioFile) missing.push('audio');
   if (missing.length) {
@@ -377,17 +742,26 @@ async function importDriveFolderExam(sourceUrl, html) {
   const workDir = path.join(STORAGE_ROOT, 'crawler', hash);
   const pdfDir = path.join(workDir, 'pdf');
   const imageDir = path.join(workDir, 'pages');
-  const examPdfPath = await downloadFile(assets.primaryExam.url, path.join(pdfDir, `${safeFilePart(assets.primaryExam.id)}-${safeFilePart(assets.primaryExam.name)}`));
+  const cropDir = path.join(workDir, 'questions');
   const localAudioPath = await downloadFile(audioFile.url, path.join(workDir, `${safeFilePart(audioFile.id)}-${safeFilePart(audioFile.name)}`));
   const audioUrl = storageUrl(localAudioPath);
 
   const answerMap = await parseAnswerKeyFiles(assets.answers, pdfDir, meta);
-  const pageCount = await pdfPageCount(examPdfPath);
-  const pageImages = await renderPdfPages(examPdfPath, imageDir, meta.slug);
-  const fullText = await pdfText(examPdfPath);
-  const pageTexts = fullText.split('\f').slice(0, pageCount);
-  const pageByQuestion = mapQuestionPages(pageTexts, pageImages, meta);
-  const questions = buildPdfBackedQuestions(meta, answerMap, pageByQuestion, audioUrl, sourceUrl);
+  const pageImages = [];
+  const pageTexts = [];
+  const bboxPages = [];
+  for (const [index, examPdf] of assets.usableExamPdfs.entries()) {
+    const examPdfPath = await downloadFile(examPdf.url, path.join(pdfDir, `${safeFilePart(examPdf.id)}-${safeFilePart(examPdf.name)}`));
+    const pageCount = await pdfPageCount(examPdfPath);
+    const prefix = `exam${index + 1}`;
+    const rendered = await renderPdfPages(examPdfPath, imageDir, meta.slug, prefix);
+    pageImages.push(...rendered);
+    const fullText = await pdfText(examPdfPath);
+    pageTexts.push(...fullText.split('\f').slice(0, pageCount));
+    bboxPages.push(...(await pdfBboxPages(examPdfPath)).slice(0, pageCount));
+  }
+  const questionLayouts = await buildQuestionLayouts(bboxPages, pageTexts, pageImages, cropDir, meta);
+  const questions = buildPdfBackedQuestions(meta, answerMap, questionLayouts, audioUrl, sourceUrl);
   const multipleChoiceCount = questions.filter((question) => question.type === 'multiple_choice').length;
   const answeredCount = questions.filter((question) => question.type !== 'multiple_choice' || question.answer?.choice).length;
 
@@ -801,6 +1175,7 @@ async function importQuestions(client, exam, questions) {
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
        ON CONFLICT (exam_id, number)
        DO UPDATE SET
+         section_id = EXCLUDED.section_id,
          points = EXCLUDED.points,
          prompt = EXCLUDED.prompt,
          passage = EXCLUDED.passage,
@@ -810,7 +1185,7 @@ async function importQuestions(client, exam, questions) {
          type = EXCLUDED.type,
          choices = EXCLUDED.choices,
          answer = EXCLUDED.answer,
-         explanation = EXCLUDED.explanation,
+         explanation = COALESCE(NULLIF(EXCLUDED.explanation, ''), questions.explanation),
          source_url = EXCLUDED.source_url,
          media = EXCLUDED.media`,
       [

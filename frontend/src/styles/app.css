@@ -1183,11 +1183,29 @@ button {
   font-size: 22px;
 }
 
+.result-table {
+  overflow-x: auto;
+}
+
+.result-table-head,
 .result-row {
   display: grid;
-  grid-template-columns: 88px 1fr auto;
+  grid-template-columns: 88px minmax(150px, 1.2fr) minmax(150px, 1.2fr) 78px minmax(180px, 1fr) 34px;
   align-items: center;
   gap: 10px;
+  min-width: 880px;
+}
+
+.result-table-head {
+  border-top: 1px solid #ddd;
+  padding: 10px 0;
+  color: #666;
+  font-size: 12px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.result-row {
   border-top: 1px solid #ddd;
   padding: 10px 0;
   font-weight: 900;
@@ -1195,6 +1213,16 @@ button {
 
 .result-row small {
   color: #777;
+  font-weight: 800;
+  line-height: 1.35;
+}
+
+.result-ok {
+  color: #167a34;
+}
+
+.result-bad {
+  color: #c42121;
 }
 
 .retake-btn {

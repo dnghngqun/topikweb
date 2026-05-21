@@ -18,6 +18,7 @@ export async function askOpenRouter(messages, options = {}) {
       model,
       messages,
       temperature: options.temperature ?? 0.2,
+      ...(options.max_tokens ? { max_tokens: options.max_tokens } : {}),
     },
     {
       headers: {

@@ -9,6 +9,17 @@ function answerLabel(value) {
   return String(value);
 }
 
+function displayAnswer(item, field, fallbackField) {
+  return item[field] || answerLabel(item[fallbackField]);
+}
+
+function explanationText(item) {
+  if (item.explanation) return item.explanation;
+  if (!item.gradable) return 'Câu này cần chấm thủ công.';
+  if (item.correct) return `Đúng. Bạn được ${item.score_awarded || 0}/${item.points || 0} điểm.`;
+  return `Sai. Bạn chọn ${displayAnswer(item, 'user_answer_text', 'user_answer')}; đáp án đúng là ${displayAnswer(item, 'correct_answer_text', 'correct_answer')}.`;
+}
+
 export function ExamResult() {
   const { slug, attemptId } = useParams();
   const [data, setData] = useState(null);
@@ -17,14 +28,16 @@ export function ExamResult() {
     api(`/attempts/${attemptId}/result`).then(setData).catch(console.error);
   }, [attemptId]);
 
-  const wrongItems = useMemo(
-    () => (data?.items || []).filter((item) => item.gradable && item.user_answer && !item.correct),
+  const detailItems = useMemo(
+    () => (data?.items || []).filter((item) => item.user_answer || item.type !== 'multiple_choice'),
     [data],
   );
 
   if (!data) return <div className="center-card">Đang tính kết quả...</div>;
 
   const { exam, summary } = data;
+  const scoreTotal = summary.auto_gradable_score || summary.total_score;
+  const hasManualItems = summary.manual_count > 0;
 
   return (
     <div className="result-page">
@@ -40,7 +53,7 @@ export function ExamResult() {
 
       <div className="result-grid">
         <div className="result-card score-card">
-          <strong>{summary.has_answer_key ? `${summary.auto_score}/${summary.total_score}` : '--'}</strong>
+          <strong>{summary.has_answer_key ? `${summary.auto_score}/${scoreTotal}` : '--'}</strong>
           <span>{summary.has_answer_key ? 'Điểm tự động' : 'Nguồn này chưa công khai đáp án'}</span>
         </div>
         <div className="result-card">
@@ -58,20 +71,38 @@ export function ExamResult() {
           Crawler lấy được đề, ảnh và audio, nhưng nguồn này không để lộ đáp án đúng trong HTML public nên hệ thống không chấm bừa.
         </div>
       ) : null}
+      {summary.has_answer_key && hasManualItems ? (
+        <div className="result-notice">
+          Phần trắc nghiệm đã chấm tự động. {summary.manual_count} câu viết/tự luận cần chấm thủ công nên không cộng vào điểm tự động.
+        </div>
+      ) : null}
 
       <section className="result-list">
         <h2>Chi tiết câu trả lời</h2>
-        {(summary.has_answer_key ? wrongItems : data.items.filter((item) => item.user_answer)).slice(0, 80).map((item) => (
-          <div className="result-row" key={item.number}>
-            <span>Câu {item.number}</span>
-            <b>{answerLabel(item.user_answer)}</b>
-            {item.gradable ? (
-              item.correct ? <CheckCircle2 size={18} /> : <XCircle size={18} />
-            ) : (
-              <small>Chưa có đáp án</small>
-            )}
+        <div className="result-table">
+          <div className="result-table-head">
+            <span>Câu</span>
+            <span>Bài làm</span>
+            <span>Đáp án</span>
+            <span>Điểm</span>
+            <span>Giải thích</span>
+            <span />
           </div>
-        ))}
+          {detailItems.slice(0, 120).map((item) => (
+            <div className="result-row" key={item.number}>
+              <span>Câu {item.number}</span>
+              <b>{displayAnswer(item, 'user_answer_text', 'user_answer')}</b>
+              <b>{item.gradable ? displayAnswer(item, 'correct_answer_text', 'correct_answer') : 'Chấm thủ công'}</b>
+              <b>{item.gradable ? `${item.score_awarded || 0}/${item.points || 0}` : '-'}</b>
+              <small>{explanationText(item)}</small>
+              {item.gradable ? (
+                item.correct ? <CheckCircle2 className="result-ok" size={18} /> : <XCircle className="result-bad" size={18} />
+              ) : (
+                <small>Manual</small>
+              )}
+            </div>
+          ))}
+        </div>
       </section>
 
       <Link className="start-btn retake-btn" to={`/topik/${slug}/take`}><RotateCcw size={20} /> Làm lại</Link>
