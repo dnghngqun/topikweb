@@ -148,6 +148,85 @@ function driveDownloadUrl(id) {
   return `https://drive.google.com/uc?export=download&id=${encodeURIComponent(id)}`;
 }
 
+function fileNameFromUrl(url, fallback = 'asset') {
+  try {
+    const parsed = new URL(url);
+    const last = parsed.pathname.split('/').filter(Boolean).pop() || fallback;
+    return decodeURIComponent(last).replace(/[?#].*$/, '') || fallback;
+  } catch (_error) {
+    return fallback;
+  }
+}
+
+function directAssetFile(url, label = '') {
+  const name = fileNameFromUrl(url, label || 'asset');
+  const lower = name.toLowerCase();
+  const mime = /\.pdf$/i.test(name)
+    ? 'application/pdf'
+    : /\.(mp3|mpeg)$/i.test(name)
+      ? 'audio/mpeg'
+      : /\.m4a$/i.test(name)
+        ? 'audio/mp4'
+        : /\.wav$/i.test(name)
+          ? 'audio/wav'
+          : 'application/octet-stream';
+  return {
+    id: crypto.createHash('sha1').update(url).digest('hex').slice(0, 16),
+    name: label && !/\.(pdf|mp3|m4a|wav|ogg)$/i.test(label) ? `${label} ${name}` : name,
+    mime,
+    size: 0,
+    url,
+  };
+}
+
+function assetRoundLevel(text) {
+  const searchable = String(text || '').replace(/[_-]+/g, ' ');
+  const roundMatch =
+    searchable.match(/(\d{2,3})(?:st|nd|rd|th)?\s+TOPIK/i) ||
+    searchable.match(/TOPIK\s*(\d{2,3})/i) ||
+    searchable.match(/(?:제\s*)?(\d{2,3})\s*회/i);
+  const round = roundMatch ? Number(roundMatch[1]) : 0;
+  const level = /TOPIK\s*(?:II|2)|TOPIKII|TOPIK\s*Ⅱ/i.test(searchable)
+    ? 'II'
+    : /TOPIK\s*(?:I|1)(?!I)|TOPIKI|TOPIK\s*Ⅰ/i.test(searchable)
+      ? 'I'
+      : '';
+  return { round, level };
+}
+
+function directAssetGroups(sourceUrl, html) {
+  const $ = cheerio.load(html);
+  const byRound = new Map();
+  $('a[href]').each((_, anchor) => {
+    const href = absoluteUrl(sourceUrl, $(anchor).attr('href'));
+    if (!/\.(pdf|mp3|m4a|wav|ogg)(?:[?#].*)?$/i.test(href)) return;
+    const label = $(anchor).text().replace(/\s+/g, ' ').trim();
+    const file = directAssetFile(href, label);
+    const { round, level } = assetRoundLevel(`${href} ${label} ${file.name}`);
+    if (!round) return;
+    if (!byRound.has(round)) byRound.set(round, { shared: [], I: [], II: [] });
+    const roundGroup = byRound.get(round);
+    if (level === 'I') roundGroup.I.push(file);
+    else if (level === 'II') roundGroup.II.push(file);
+    else roundGroup.shared.push(file);
+  });
+
+  const groups = [];
+  for (const [round, roundGroup] of byRound.entries()) {
+    for (const level of ['I', 'II']) {
+      const files = [...roundGroup[level], ...roundGroup.shared];
+      if (!files.length) continue;
+      groups.push({
+        sourceUrl,
+        files,
+        round,
+        level,
+      });
+    }
+  }
+  return groups.sort((a, b) => b.round - a.round || a.level.localeCompare(b.level));
+}
+
 function parseGoogleDriveFiles(html) {
   const match = html.match(/window\['_DRIVE_ivd'\]\s*=\s*'([\s\S]*?)';/);
   if (!match) return [];
@@ -369,6 +448,88 @@ function parseAnswerKeysFromText(text, { level, sectionHint }) {
   return answers;
 }
 
+function expectedAnswerCount(meta) {
+  return meta.topik_level === 'I' ? 70 : 100;
+}
+
+function parseJsonArray(content) {
+  const text = String(content || '').trim();
+  try {
+    const parsed = JSON.parse(text);
+    return Array.isArray(parsed) ? parsed : parsed.items || parsed.answers || [];
+  } catch (_error) {
+    const match = text.match(/\[[\s\S]*\]/);
+    if (!match) return [];
+    try {
+      const parsed = JSON.parse(match[0]);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (__error) {
+      return [];
+    }
+  }
+}
+
+function normalizeAiAnswerEntry(entry, meta) {
+  const number = Number(entry.number ?? entry.question ?? entry.q);
+  const rawChoice = String(entry.choice ?? entry.answer ?? entry.correct ?? '').trim();
+  const choice = CIRCLED_TO_CHOICE[rawChoice] || (rawChoice.match(/[①②③④]/) ? CIRCLED_TO_CHOICE[rawChoice.match(/[①②③④]/)[0]] : rawChoice.match(/[1-4]/)?.[0]);
+  if (!number || number > (meta.topik_level === 'I' ? 70 : 104) || !choice) return null;
+  return {
+    number,
+    answer: {
+      choice,
+      points: Number(entry.points ?? entry.score ?? entry.point) || defaultQuestionPoints(meta, number),
+    },
+  };
+}
+
+async function imageDataUrl(filePath) {
+  const buffer = await fs.readFile(filePath);
+  return `data:image/png;base64,${buffer.toString('base64')}`;
+}
+
+async function parseAnswerKeyWithVision(localPdfPath, workDir, meta, fileName) {
+  if (process.env.ANSWER_KEY_OCR_ENABLED === 'false' || !process.env.OPENROUTER_API_KEY) return new Map();
+  const pageLimit = Number(process.env.ANSWER_KEY_OCR_MAX_PAGES || 6);
+  const imageDir = path.join(workDir, 'answer-ocr', safeFilePart(fileName));
+  const pages = (await renderPdfPages(localPdfPath, imageDir, `answer-${safeFilePart(fileName)}`, 'page')).slice(0, pageLimit);
+  const answers = new Map();
+
+  for (const page of pages) {
+    const dataUrl = await imageDataUrl(page.path);
+    const response = await askOpenRouter([
+      {
+        role: 'system',
+        content:
+          'Bạn là OCR/parser đáp án TOPIK. Đọc ảnh bảng đáp án chính thức. Trả về JSON array duy nhất, mỗi item: {"number": số_câu, "choice": "1|2|3|4", "points": điểm}. Không đoán câu không nhìn rõ. Không markdown.',
+      },
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text:
+              `Ảnh này là trang đáp án TOPIK ${meta.topik_level}, kỳ ${meta.round_no}. ` +
+              'Các đáp án có thể là ①②③④ hoặc số 1-4. Hãy trích xuất tất cả câu nhìn rõ.',
+          },
+          { type: 'image_url', image_url: { url: dataUrl } },
+        ],
+      },
+    ], {
+      model: process.env.OPENROUTER_VISION_MODEL || process.env.OPENROUTER_MODEL || 'openrouter/free',
+      temperature: 0,
+      max_tokens: 2400,
+      response_format: { type: 'json_object' },
+    });
+    for (const entry of parseJsonArray(response.content)) {
+      const normalized = normalizeAiAnswerEntry(entry, meta);
+      if (normalized) answers.set(normalized.number, normalized.answer);
+    }
+  }
+  if (answers.size) console.log(`[crawler] OCR answer key ${fileName}: ${answers.size}/${expectedAnswerCount(meta)}`);
+  return answers;
+}
+
 async function parseAnswerKeyFiles(answerFiles, workDir, meta) {
   const answers = new Map();
   for (const file of answerFiles) {
@@ -377,6 +538,20 @@ async function parseAnswerKeyFiles(answerFiles, workDir, meta) {
     const sectionHint = /읽기|reading/i.test(file.name) ? 'reading' : /듣기|listening/i.test(file.name) ? 'listening' : '';
     const parsed = parseAnswerKeysFromText(text, { level: meta.topik_level, sectionHint });
     parsed.forEach((answer, number) => answers.set(number, answer));
+  }
+  if (answers.size < expectedAnswerCount(meta)) {
+    for (const file of answerFiles) {
+      if (answers.size >= expectedAnswerCount(meta)) break;
+      const local = file.localPath || path.join(workDir, `${safeFilePart(file.id)}-${safeFilePart(file.name)}`);
+      try {
+        const parsed = await parseAnswerKeyWithVision(local, workDir, meta, file.name);
+        parsed.forEach((answer, number) => {
+          if (!answers.has(number)) answers.set(number, answer);
+        });
+      } catch (error) {
+        console.warn(`[crawler] OCR answer key failed ${file.name}: ${error.message}`);
+      }
+    }
   }
   return answers;
 }
@@ -799,7 +974,11 @@ function buildPdfBackedQuestions(meta, answerMap, questionLayouts, audioUrl, sou
 
 async function importDriveFolderExam(sourceUrl, html) {
   const files = parseGoogleDriveFiles(html);
-  const meta = inferMetaFromName(sourceUrl, files.map((file) => file.name).join(' '), 'google-drive');
+  return importAssetBundleExam(sourceUrl, files, 'google-drive');
+}
+
+async function importAssetBundleExam(sourceUrl, files, importedFrom = 'asset-page') {
+  const meta = inferMetaFromName(sourceUrl, files.map((file) => file.name).join(' '), importedFrom);
   const hash = crypto.createHash('sha1').update(sourceUrl).digest('hex').slice(0, 12);
   meta.slug = `topik-${meta.topik_level.toLowerCase()}-${meta.round_no}-${hash}`;
   const workDir = path.join(STORAGE_ROOT, 'crawler', hash);
@@ -859,6 +1038,25 @@ async function importDriveFolderExam(sourceUrl, html) {
       files,
     },
   };
+}
+
+async function importDirectAssetPage(sourceUrl, html) {
+  const groups = directAssetGroups(sourceUrl, html);
+  const limit = Number(process.env.DIRECT_ASSET_GROUP_LIMIT || 3);
+  const payloads = [];
+  const skipped = [];
+  for (const group of groups.slice(0, limit)) {
+    const groupUrl = `${sourceUrl}#topik-${group.level.toLowerCase()}-${group.round}`;
+    const result = await importAssetBundleExam(groupUrl, group.files, 'direct-assets');
+    if (result.skipped) skipped.push({ round: group.round, level: group.level, reason: result.reason, files: result.files });
+    else payloads.push(result);
+  }
+  if (!payloads.length) {
+    return groups.length
+      ? { skipped: true, reason: `direct_asset_groups_unusable_${skipped.length}_${groups.length}`, files: groups.flatMap((group) => group.files), assets: { groups, skipped } }
+      : null;
+  }
+  return { multi: true, payloads, skipped };
 }
 
 async function createExam(client, meta, assets) {
@@ -1109,7 +1307,12 @@ export function discoverTopikLinks(sourceUrl, html) {
       (/study4\.com\/tests\/\d+\/[^/]*topik/i.test(href)) ||
       (/onthitopik\.com\//i.test(href) && /topik/i.test(searchable) && /(đáp án|dap an|de thi|đề thi|full|chữa|nghe|đọc|thi thử)/i.test(searchable)) ||
       (/thongtinduhochanquoc\.com\//i.test(href) && /topik/i.test(searchable) && /(đáp án|dap an|de thi|đề thi|tron-bo|trọn bộ)/i.test(searchable)) ||
-      (/prepedu\.com\/vi\/blog\/de-thi-topik/i.test(href))
+      (/prepedu\.com\/vi\/blog\/de-thi-topik/i.test(href)) ||
+      (/koreanlearners\.com\//i.test(href) && /topik/i.test(searchable) && /(past|paper|download|pdf|audio|answer|test|exam|de|đề)/i.test(searchable)) ||
+      (/topikguide\.com\//i.test(href) && /topik/i.test(searchable) && /(previous|past|paper|download|pdf|audio|answer|test|exam)/i.test(searchable)) ||
+      (/koreantopik\.com\//i.test(href) && /topik/i.test(searchable) && /(download|pdf|audio|answer|test|exam|past|paper)/i.test(searchable)) ||
+      (/topik\.go\.kr\//i.test(href) && /(TOPIK|기출|문제|download|pdf|audio|answer)/i.test(searchable)) ||
+      (/studytopik\.go\.kr\//i.test(href) && /(TOPIK|기출|문제|download|pdf|audio|answer)/i.test(searchable))
     ) {
       links.add(normalizeDiscoveredUrl(href));
     }
@@ -1165,7 +1368,7 @@ export async function crawlSource(sourceUrl, options = {}) {
     ? await importDriveFolderExam(sourceUrl, html)
     : /dethitracnghiem\.vn/i.test(sourceUrl)
       ? parseDethiTracNghiem(sourceUrl, html)
-      : null;
+      : await importDirectAssetPage(sourceUrl, html);
 
   if (specialized?.skipped) {
     return withClient(async (client) => {
@@ -1211,6 +1414,24 @@ export async function crawlSource(sourceUrl, options = {}) {
     );
     const job = jobResult.rows[0];
     try {
+      if (specialized?.multi) {
+        const imported = [];
+        for (const payload of specialized.payloads) {
+          const exam = await createExam(client, payload.meta, payload.assets);
+          await importQuestions(client, exam, payload.questions);
+          imported.push({ exam, questionCount: payload.questions.length });
+        }
+        const result = {
+          imported,
+          skipped: specialized.skipped,
+          questionCount: imported.reduce((sum, item) => sum + item.questionCount, 0),
+        };
+        await client.query(
+          'UPDATE crawl_jobs SET status = $1, result = $2, finished_at = now() WHERE id = $3',
+          ['finished', JSON.stringify(result), job.id],
+        );
+        return { multi: true, imported, skipped: specialized.skipped, questionCount: result.questionCount };
+      }
       const exam = await createExam(client, meta, assets);
       if (specialized?.questions?.length) {
         await importQuestions(client, exam, specialized.questions);

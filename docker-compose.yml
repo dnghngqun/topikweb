@@ -33,6 +33,10 @@ services:
       CRAWL_ON_START_FORCE: ${CRAWL_ON_START_FORCE:-true}
       CRAWL_IMPORT_DISCOVERED: ${CRAWL_IMPORT_DISCOVERED:-true}
       CRAWL_IMPORT_DISCOVERED_LIMIT: ${CRAWL_IMPORT_DISCOVERED_LIMIT:-30}
+      DIRECT_ASSET_GROUP_LIMIT: ${DIRECT_ASSET_GROUP_LIMIT:-3}
+      ANSWER_KEY_OCR_ENABLED: ${ANSWER_KEY_OCR_ENABLED:-true}
+      ANSWER_KEY_OCR_MAX_PAGES: ${ANSWER_KEY_OCR_MAX_PAGES:-6}
+      OPENROUTER_VISION_MODEL: ${OPENROUTER_VISION_MODEL:-openrouter/free}
       PUBLIC_BACKEND_URL: ${PUBLIC_BACKEND_URL:-}
       TOPIK_DISCOVERY_MAX_DE: ${TOPIK_DISCOVERY_MAX_DE:-3}
       CRAWL_SOURCES: ${CRAWL_SOURCES:-https://dethitracnghiem.vn/bai-thi/de-thi-topik-1-de-1/,https://dethitracnghiem.vn/de-thi-topik/,https://dethitracnghiem.vn/de-thi-topik-1/,https://dethitracnghiem.vn/de-thi-topik-2/,https://prepedu.com/vi/blog/de-thi-topik-1,https://prepedu.com/vi/blog/de-thi-topik-2,https://onthitopik.com/tai-tron-bo-de-thi-topik-va-dap-an/,https://study4.com/tests/?term=topik&page=1,https://study4.com/tests/topik-i/,https://study4.com/tests/topik-ii/,https://www.thongtinduhochanquoc.com/tron-bo-de-thi-topik-i-topik-ii-tieng-han-ki-52-co-dap-an/}

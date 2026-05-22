@@ -27,6 +27,11 @@ const DEFAULT_SOURCES = [
   'https://study4.com/tests/topik-i/',
   'https://study4.com/tests/topik-ii/',
   'https://www.thongtinduhochanquoc.com/tron-bo-de-thi-topik-i-topik-ii-tieng-han-ki-52-co-dap-an/',
+  'https://koreanlearners.com/topik-past-papers.html',
+  'https://www.topikguide.com/previous-papers/',
+  'https://www.koreantopik.com/2018/07/download-topik-tests-pdf-audio-answer.html',
+  'https://www.topik.go.kr/TWSTDY/TWSTDY0080.do',
+  'https://www.studytopik.go.kr/sub-1/link_url.asp?ma_url=sub_1',
 ];
 
 async function ensureSources() {
@@ -92,8 +97,16 @@ export async function runDueCrawls({ force = false } = {}) {
         if (result?.skipped) {
           console.log(`[crawler] skipped self ${source.url}: ${skipDetail(result)}`);
         } else {
-          imported++;
+          imported += result?.multi ? result.imported.length : 1;
           console.log(`[crawler] imported self ${source.url}`);
+        }
+      } else if (/koreanlearners\.com|topikguide\.com|koreantopik\.com/i.test(source.url)) {
+        const result = await crawlSource(source.url);
+        if (result?.skipped) {
+          console.log(`[crawler] skipped direct index ${source.url}: ${skipDetail(result)}`);
+        } else {
+          imported += result?.multi ? result.imported.length : 1;
+          console.log(`[crawler] imported direct index ${source.url}: ${result?.multi ? result.imported.length : 1}`);
         }
       } else if (process.env.CRAWL_IMPORT_DISCOVERED !== 'false') {
         const importLimit = Number(process.env.CRAWL_IMPORT_DISCOVERED_LIMIT || 30);
