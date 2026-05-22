@@ -211,7 +211,7 @@ app.get('/api/exams/:slug/questions', requireAuth, async (req, res) => {
     [exam.id],
   );
   const sections = await query('SELECT * FROM exam_sections WHERE exam_id = $1 ORDER BY sort_order', [exam.id]);
-  res.json({ exam, sections: sections.rows, questions: questions.rows });
+  res.json({ exam, sections: sections.rows, questions: questions.rows.map(publicQuestion) });
 });
 
 app.post('/api/exams/:slug/attempts', requireAuth, async (req, res) => {
@@ -237,6 +237,21 @@ function stripHtml(value) {
     .replace(/<[^>]+>/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+function publicMediaUrl(value) {
+  if (typeof value !== 'string') return value;
+  return value.replace(/https?:\/\/(?:localhost|127\.0\.0\.1):\d+\/media\//g, '/media/');
+}
+
+function publicQuestion(row) {
+  return {
+    ...row,
+    content_html: publicMediaUrl(row.content_html),
+    image_url: publicMediaUrl(row.image_url),
+    audio_url: publicMediaUrl(row.audio_url),
+    media: JSON.parse(publicMediaUrl(JSON.stringify(row.media || {}))),
+  };
 }
 
 async function gradeAttempt(examId, answers) {

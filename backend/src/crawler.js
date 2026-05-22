@@ -10,7 +10,7 @@ import { askOpenRouter } from './openrouter.js';
 
 const execFileAsync = promisify(execFile);
 const STORAGE_ROOT = process.env.CRAWLER_STORAGE_DIR || path.resolve(process.cwd(), 'storage');
-const MEDIA_BASE_URL = (process.env.PUBLIC_BACKEND_URL || 'http://localhost:4000').replace(/\/+$/, '');
+const MEDIA_BASE_URL = (process.env.PUBLIC_BACKEND_URL || '').replace(/\/+$/, '');
 const CIRCLED_TO_CHOICE = { '①': '1', '②': '2', '③': '3', '④': '4' };
 const CHOICE_LABELS = ['①', '②', '③', '④'];
 const PDF_RENDER_DPI = 120;
