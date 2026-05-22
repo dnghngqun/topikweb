@@ -2,6 +2,19 @@ import axios from 'axios';
 import { query } from './db.js';
 import { crawlSource, discoverTopikLinks, isImportableExamSource } from './crawler.js';
 
+function skipDetail(result) {
+  const files = (result?.files || result?.assets?.files || [])
+    .map((file) => `${file.name}${file.textKind ? `:${file.textKind}` : ''}`)
+    .slice(0, 12)
+    .join(' | ');
+  const answers = (result?.assets?.answers || []).map((file) => file.name).join(' | ');
+  const exams = (result?.assets?.usableExamPdfs || []).map((file) => file.name).join(' | ');
+  const audio = (result?.assets?.audio || []).map((file) => file.name).join(' | ');
+  return [result?.reason, files && `files=${files}`, answers && `answers=${answers}`, exams && `exams=${exams}`, audio && `audio=${audio}`]
+    .filter(Boolean)
+    .join(' ; ');
+}
+
 const DEFAULT_SOURCES = [
   'https://dethitracnghiem.vn/bai-thi/de-thi-topik-1-de-1/',
   'https://dethitracnghiem.vn/de-thi-topik/',
@@ -77,7 +90,7 @@ export async function runDueCrawls({ force = false } = {}) {
       if (shouldImportSelf) {
         const result = await crawlSource(source.url);
         if (result?.skipped) {
-          console.log(`[crawler] skipped self ${source.url}: ${result.reason}`);
+          console.log(`[crawler] skipped self ${source.url}: ${skipDetail(result)}`);
         } else {
           imported++;
           console.log(`[crawler] imported self ${source.url}`);
@@ -88,7 +101,7 @@ export async function runDueCrawls({ force = false } = {}) {
           try {
             const result = await crawlSource(link);
             if (result?.skipped) {
-              console.log(`[crawler] skipped discovered ${link}: ${result.reason}`);
+              console.log(`[crawler] skipped discovered ${link}: ${skipDetail(result)}`);
             } else {
               imported++;
               console.log(`[crawler] imported discovered ${link}`);

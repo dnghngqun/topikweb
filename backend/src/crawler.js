@@ -108,12 +108,40 @@ function extractAssets(sourceUrl, html) {
 }
 
 function isAnswerKeyName(name) {
-  return /정답|답안|dap[\s_-]*an|đáp[\s_-]*án|answer/i.test(name || '');
+  return /정답|답안|dap[\s_-]*an|đáp[\s_-]*án|answer|key|correct/i.test(name || '');
 }
 
 function isExamPdfName(name) {
   const normalized = String(name || '');
-  return /\.pdf$/i.test(normalized) && !isAnswerKeyName(normalized) && /TOPIK|토픽|듣기|읽기|쓰기|기출/i.test(normalized);
+  return /\.pdf$/i.test(normalized) && !isAnswerKeyName(normalized) && /TOPIK|토픽|듣기|읽기|쓰기|기출|de[\s_-]*thi|đề[\s_-]*thi|exam|test/i.test(normalized);
+}
+
+function classifyPdfText(text) {
+  const compact = String(text || '').replace(/\s+/g, ' ');
+  if (/정\s*답\s*표|문항번호\s*정답\s*배점|answer\s*key|đáp\s*án|dap\s*an/i.test(compact)) return 'answer';
+  if (/transcript|script|대본|듣기\s*통합|file\s*nghe|listening\s*script/i.test(compact)) return 'transcript';
+  if (/TOPIK|한국어능력시험|Test of Proficiency in Korean|다음을\s*(?:듣고|읽고)|물음에\s*답하십시오|고르십시오/i.test(compact)) return 'exam';
+  return 'unknown';
+}
+
+async function enrichDriveAssets(files, workDir) {
+  const enriched = [];
+  await ensureDir(workDir);
+  for (const file of files) {
+    if (!(/pdf/i.test(file.mime) || /\.pdf$/i.test(file.name))) {
+      enriched.push(file);
+      continue;
+    }
+    const local = await downloadFile(file.url, path.join(workDir, `${safeFilePart(file.id)}-${safeFilePart(file.name)}`));
+    const text = await pdfText(local).catch(() => '');
+    enriched.push({
+      ...file,
+      localPath: local,
+      textKind: classifyPdfText(text),
+      textSample: text.replace(/\s+/g, ' ').slice(0, 240),
+    });
+  }
+  return enriched;
 }
 
 function driveDownloadUrl(id) {
@@ -148,13 +176,14 @@ function parseGoogleDriveFiles(html) {
 function classifyAssetFiles(files) {
   const pdfs = files.filter((file) => /pdf/i.test(file.mime) || /\.pdf$/i.test(file.name));
   const audio = files.filter((file) => /^audio\//i.test(file.mime) || /\.(mp3|wav|m4a|ogg)$/i.test(file.name));
-  const answers = pdfs.filter((file) => isAnswerKeyName(file.name));
-  const exams = pdfs.filter((file) => isExamPdfName(file.name));
+  const answers = pdfs.filter((file) => isAnswerKeyName(file.name) || file.textKind === 'answer');
+  const transcriptPdfs = pdfs.filter((file) => /통합|transcript|script|file\s*nghe|mp3|audio|대본/i.test(file.name) || file.textKind === 'transcript');
+  const exams = pdfs.filter((file) => (isExamPdfName(file.name) || file.textKind === 'exam') && !answers.includes(file) && !transcriptPdfs.includes(file));
   const combinedExam = exams.find((file) => /(?:듣기|nghe|listening).*(?:읽기|đọc|doc|reading)|(?:읽기|đọc|doc|reading).*(?:듣기|nghe|listening)|기출/i.test(file.name));
   const usableExamPdfs = combinedExam
     ? [combinedExam]
     : exams
-        .filter((file) => !/통합|transcript|script|file\s*nghe|mp3|audio/i.test(file.name))
+        .filter((file) => !transcriptPdfs.includes(file))
         .sort((a, b) => {
           const rank = (file) => {
             if (/듣기|nghe|listening/i.test(file.name)) return 1;
@@ -167,7 +196,7 @@ function classifyAssetFiles(files) {
           return rank(a) - rank(b) || a.name.localeCompare(b.name);
         });
   const primaryExam = usableExamPdfs[0] || exams[0];
-  return { pdfs, audio, answers, exams, primaryExam, usableExamPdfs };
+  return { pdfs, audio, answers, exams, transcriptPdfs, primaryExam, usableExamPdfs };
 }
 
 async function ensureDir(dir) {
@@ -343,7 +372,7 @@ function parseAnswerKeysFromText(text, { level, sectionHint }) {
 async function parseAnswerKeyFiles(answerFiles, workDir, meta) {
   const answers = new Map();
   for (const file of answerFiles) {
-    const local = await downloadFile(file.url, path.join(workDir, `${safeFilePart(file.id)}-${safeFilePart(file.name)}`));
+    const local = file.localPath || await downloadFile(file.url, path.join(workDir, `${safeFilePart(file.id)}-${safeFilePart(file.name)}`));
     const text = await pdfText(local);
     const sectionHint = /읽기|reading/i.test(file.name) ? 'reading' : /듣기|listening/i.test(file.name) ? 'listening' : '';
     const parsed = parseAnswerKeysFromText(text, { level: meta.topik_level, sectionHint });
@@ -770,8 +799,15 @@ function buildPdfBackedQuestions(meta, answerMap, questionLayouts, audioUrl, sou
 
 async function importDriveFolderExam(sourceUrl, html) {
   const files = parseGoogleDriveFiles(html);
-  const assets = classifyAssetFiles(files);
   const meta = inferMetaFromName(sourceUrl, files.map((file) => file.name).join(' '), 'google-drive');
+  const hash = crypto.createHash('sha1').update(sourceUrl).digest('hex').slice(0, 12);
+  meta.slug = `topik-${meta.topik_level.toLowerCase()}-${meta.round_no}-${hash}`;
+  const workDir = path.join(STORAGE_ROOT, 'crawler', hash);
+  const pdfDir = path.join(workDir, 'pdf');
+  const imageDir = path.join(workDir, 'pages');
+  const cropDir = path.join(workDir, 'questions');
+  const enrichedFiles = await enrichDriveAssets(files, pdfDir);
+  const assets = classifyAssetFiles(enrichedFiles);
   const audioFile = assets.audio[0];
   const missing = [];
   if (!assets.usableExamPdfs?.length) missing.push('exam_pdf');
@@ -781,12 +817,6 @@ async function importDriveFolderExam(sourceUrl, html) {
     return { skipped: true, reason: `missing_${missing.join('_')}`, files, assets };
   }
 
-  const hash = crypto.createHash('sha1').update(sourceUrl).digest('hex').slice(0, 12);
-  meta.slug = `topik-${meta.topik_level.toLowerCase()}-${meta.round_no}-${hash}`;
-  const workDir = path.join(STORAGE_ROOT, 'crawler', hash);
-  const pdfDir = path.join(workDir, 'pdf');
-  const imageDir = path.join(workDir, 'pages');
-  const cropDir = path.join(workDir, 'questions');
   const localAudioPath = await downloadFile(audioFile.url, path.join(workDir, `${safeFilePart(audioFile.id)}-${safeFilePart(audioFile.name)}`));
   const audioUrl = storageUrl(localAudioPath);
 
@@ -795,7 +825,7 @@ async function importDriveFolderExam(sourceUrl, html) {
   const pageTexts = [];
   const bboxPages = [];
   for (const [index, examPdf] of assets.usableExamPdfs.entries()) {
-    const examPdfPath = await downloadFile(examPdf.url, path.join(pdfDir, `${safeFilePart(examPdf.id)}-${safeFilePart(examPdf.name)}`));
+    const examPdfPath = examPdf.localPath || await downloadFile(examPdf.url, path.join(pdfDir, `${safeFilePart(examPdf.id)}-${safeFilePart(examPdf.name)}`));
     const pageCount = await pdfPageCount(examPdfPath);
     const prefix = `exam${index + 1}`;
     const rendered = await renderPdfPages(examPdfPath, imageDir, meta.slug, prefix);
