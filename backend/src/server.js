@@ -25,6 +25,28 @@ app.use((req, _res, next) => {
   next();
 });
 
+function publicMediaUrl(value) {
+  if (typeof value !== 'string') return value;
+  return value.replace(/https?:\/\/(?:localhost|127\.0\.0\.1):\d+\/media\//g, '/media/');
+}
+
+function publicExam(row) {
+  return {
+    ...row,
+    audio_url: publicMediaUrl(row.audio_url),
+  };
+}
+
+function publicQuestion(row) {
+  return {
+    ...row,
+    content_html: publicMediaUrl(row.content_html),
+    image_url: publicMediaUrl(row.image_url),
+    audio_url: publicMediaUrl(row.audio_url),
+    media: JSON.parse(publicMediaUrl(JSON.stringify(row.media || {}))),
+  };
+}
+
 app.get('/api/health', async (_req, res) => {
   const db = await query('SELECT now() AS now');
   res.json({ ok: true, db: db.rows[0].now });
@@ -177,7 +199,7 @@ app.get('/api/exams', optionalAuth, async (req, res) => {
      ORDER BY es.topik_level DESC, es.round_no DESC, es.created_at DESC`,
     params,
   );
-  res.json({ exams: result.rows });
+  res.json({ exams: result.rows.map(publicExam) });
 });
 
 app.get('/api/exams/:slug', optionalAuth, async (req, res) => {
@@ -188,7 +210,7 @@ app.get('/api/exams/:slug', optionalAuth, async (req, res) => {
   }
 
   const sections = await query('SELECT * FROM exam_sections WHERE exam_id = $1 ORDER BY sort_order', [exam.id]);
-  res.json({ exam, sections: sections.rows });
+  res.json({ exam: publicExam(exam), sections: sections.rows });
 });
 
 app.get('/api/exams/:slug/questions', requireAuth, async (req, res) => {
@@ -211,7 +233,7 @@ app.get('/api/exams/:slug/questions', requireAuth, async (req, res) => {
     [exam.id],
   );
   const sections = await query('SELECT * FROM exam_sections WHERE exam_id = $1 ORDER BY sort_order', [exam.id]);
-  res.json({ exam, sections: sections.rows, questions: questions.rows.map(publicQuestion) });
+  res.json({ exam: publicExam(exam), sections: sections.rows, questions: questions.rows.map(publicQuestion) });
 });
 
 app.post('/api/exams/:slug/attempts', requireAuth, async (req, res) => {
@@ -237,21 +259,6 @@ function stripHtml(value) {
     .replace(/<[^>]+>/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
-}
-
-function publicMediaUrl(value) {
-  if (typeof value !== 'string') return value;
-  return value.replace(/https?:\/\/(?:localhost|127\.0\.0\.1):\d+\/media\//g, '/media/');
-}
-
-function publicQuestion(row) {
-  return {
-    ...row,
-    content_html: publicMediaUrl(row.content_html),
-    image_url: publicMediaUrl(row.image_url),
-    audio_url: publicMediaUrl(row.audio_url),
-    media: JSON.parse(publicMediaUrl(JSON.stringify(row.media || {}))),
-  };
 }
 
 async function gradeAttempt(examId, answers) {

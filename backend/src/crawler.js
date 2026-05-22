@@ -256,41 +256,85 @@ async function pdfBboxPages(pdfPath) {
 
 function parseAnswerKeysFromText(text, { level, sectionHint }) {
   const sourceText = String(text || '');
-  const firstScoreLabel = sourceText.indexOf('배점');
-  const tableStart = firstScoreLabel >= 0 ? firstScoreLabel + 2 : 0;
-  const tableText = sourceText.slice(tableStart);
-  const rawTokens = tableText
-    .split(/\s+/)
-    .map((token) => token.trim())
-    .filter(Boolean);
-  const tokens = rawTokens.filter((token) => /^\d{1,3}$/.test(token) || /^[①②③④]$/.test(token));
   const answers = new Map();
-
   const isChoice = (token) => Boolean(CIRCLED_TO_CHOICE[token] || /^[1-4]$/.test(token));
+  const isCircledChoice = (token) => Boolean(CIRCLED_TO_CHOICE[token]);
   const isScore = (token) => /^\d{1,3}$/.test(token);
-  const firstRow = tokens.findIndex((token, index) => Number(token) > 0 && isChoice(tokens[index + 1]) && isScore(tokens[index + 2]));
-  if (firstRow < 0) return answers;
 
-  const addAnswer = (numberToken, answerToken, scoreToken) => {
+  const addAnswer = (numberToken, answerToken, scoreToken, effectiveSectionHint, shouldOffsetReading = true) => {
     const number = Number(numberToken);
     if (!number || number > 120) return;
     const choice = CIRCLED_TO_CHOICE[answerToken] || (/^[1-4]$/.test(answerToken) ? answerToken : '');
     if (!choice) return;
     const points = Number(scoreToken) || 0;
     let questionNumber = number;
-    if (/reading/i.test(sectionHint || '') || /읽기/.test(text)) {
-      if (level === 'I' && number <= 40) questionNumber = number + 30;
-      if (level === 'II' && number <= 50) questionNumber = number + 54;
+    if (/reading/i.test(effectiveSectionHint || '') || /읽기/.test(effectiveSectionHint || '')) {
+      if (shouldOffsetReading && level === 'I' && number <= 40) questionNumber = number + 30;
+      if (shouldOffsetReading && level === 'II' && number <= 50) questionNumber = number + 54;
     }
     answers.set(questionNumber, { choice, points });
   };
 
-  for (let index = firstRow; index < tokens.length - 2; index += 6) {
-    if (Number(tokens[index]) && isChoice(tokens[index + 1]) && isScore(tokens[index + 2])) {
-      addAnswer(tokens[index], tokens[index + 1], tokens[index + 2]);
+  for (const pageText of sourceText.split('\f')) {
+    const pageSectionHint = /영역\s*:\s*읽기|읽기/.test(pageText)
+      ? 'reading'
+      : /영역\s*:\s*듣기|듣기/.test(pageText)
+        ? 'listening'
+        : sectionHint || '';
+    const firstQuestionLabel = pageText.indexOf('문항번호');
+    const tableStart = firstQuestionLabel >= 0 ? firstQuestionLabel : 0;
+    const tableText = pageText.slice(tableStart);
+    const rawTokens = tableText
+      .split(/\s+/)
+      .map((token) => token.trim())
+      .filter(Boolean);
+    const tokens = rawTokens.filter((token) => /^\d{1,3}$/.test(token) || /^[①②③④]$/.test(token));
+    const shouldOffsetReading =
+      !/reading/i.test(pageSectionHint) && !/읽기/.test(pageSectionHint)
+        ? false
+        : level === 'I'
+          ? !tokens.some((token) => /^\d{1,3}$/.test(token) && Number(token) > 40)
+          : !tokens.some((token) => /^\d{1,3}$/.test(token) && Number(token) > 50);
+
+    for (let index = 0; index < tokens.length - 2;) {
+      if (Number(tokens[index]) && isCircledChoice(tokens[index + 1]) && isScore(tokens[index + 2])) {
+        addAnswer(tokens[index], tokens[index + 1], tokens[index + 2], pageSectionHint, shouldOffsetReading);
+        index += 3;
+      } else {
+        index += 1;
+      }
     }
-    if (Number(tokens[index + 3]) && isChoice(tokens[index + 4]) && isScore(tokens[index + 5])) {
-      addAnswer(tokens[index + 3], tokens[index + 4], tokens[index + 5]);
+
+    for (let index = 0; index < tokens.length;) {
+      let numberCount = 0;
+      while (/^\d{1,3}$/.test(tokens[index + numberCount] || '') && !isChoice(tokens[index + numberCount])) {
+        numberCount += 1;
+      }
+      if (numberCount < 5) {
+        index += 1;
+        continue;
+      }
+
+      let choiceCount = 0;
+      while (isCircledChoice(tokens[index + numberCount + choiceCount])) {
+        choiceCount += 1;
+      }
+      const scoresStart = index + numberCount + choiceCount;
+      const hasScoreBlock = Array.from({ length: numberCount }).every((_, offset) => isScore(tokens[scoresStart + offset]));
+      if (choiceCount === numberCount && hasScoreBlock) {
+        for (let offset = 0; offset < numberCount; offset += 1) {
+          addAnswer(
+            tokens[index + offset],
+            tokens[index + numberCount + offset],
+            tokens[scoresStart + offset],
+            pageSectionHint,
+            shouldOffsetReading,
+          );
+        }
+        index += numberCount + choiceCount + numberCount;
+      } else {
+        index += 1;
+      }
     }
   }
   return answers;
