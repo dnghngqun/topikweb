@@ -9,8 +9,9 @@ docker compose up -d --build
 ```
 
 Frontend: http://localhost:5173  
-Backend API: http://localhost:4000/api  
+Backend API: http://localhost:14000/api  
 Postgres host port: `55433` by default (`5432` inside Docker). Override with `POSTGRES_HOST_PORT=...` in `.env` if needed.
+Backend host port: `14000` by default (`4000` inside Docker). Override with `BACKEND_HOST_PORT=...` in `.env` if needed.
 
 ## Auth
 
